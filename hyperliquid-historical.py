@@ -14,8 +14,10 @@ import json
 
 # MUST USE PATHLIB INSTEAD
 DIR_PATH = Path(__file__).parent
-BUCKET = "hyperliquid-archive"
+BUCKET_L2BOOK = "hyperliquid-archive"
+BUCKET_TRADES = "hl-mainnet-node-data"
 CSV_HEADER = ["datetime", "timestamp", "level", "price", "size", "number"]
+TRADES_CSV_HEADER = ["user", "coin", "price", "size", "side", "timestamp", "direction", "closed_pnl", "fee", "trade_id"]
 
 # s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
 # s3.download_file('hyperliquid-archive', 'market_data/20230916/9/l2Book/SOL.lz4', f"{dir_path}/SOL.lz4")
@@ -31,6 +33,7 @@ def get_args():
     global_parser = subparser.add_parser("global_settings", add_help=False)
     global_parser.add_argument("t", metavar="Tickers", help="Tickers of assets to be downloaded seperated by spaces. e.g. BTC ETH", nargs="+")
     global_parser.add_argument("--all", help="Apply action to all available dates and times.", action="store_true", default=False)
+    global_parser.add_argument("--type", metavar="Data type", help="Type of data to download: 'l2book' for order book snapshots or 'trades' for trade data. Default: l2book", choices=["l2book", "trades"], default="l2book")
     global_parser.add_argument("-sd", metavar="Start date", help="Starting date as one unbroken string formatted: YYYYMMDD.  e.g. 20230916")
     global_parser.add_argument("-sh", metavar="Start hour", help="Hour of the starting day as an integer between 0 and 23. e.g. 9  Default: 0", type=int, default=0)
     global_parser.add_argument("-ed", metavar="End date", help="Ending date as one unbroken string formatted: YYYYMMDD.  e.g. 20230916")
@@ -84,17 +87,33 @@ def make_date_hour_list(date_list, start_hour, end_hour, delimiter="/"):
 
 
 
-async def download_object(s3, asset, date_hour):
+async def download_object(s3, asset, date_hour, data_type):
     date_and_hour = date_hour.split("/")
-    s3.download_file(BUCKET, f"market_data/{date_hour}/l2Book/{asset}.lz4", f"{DIR_PATH}/downloads/{asset}/{date_and_hour[0]}-{date_and_hour[1]}.lz4")
+    if data_type == "trades":
+        # For trades, we download all trades for that hour, not asset-specific
+        # So we ignore the asset parameter and use the hour directly
+        bucket = BUCKET_TRADES
+        key = f"node_fills/hourly/{date_and_hour[0]}/{date_and_hour[1]}.lz4"
+        local_path = f"{DIR_PATH}/downloads/trades/{date_and_hour[0]}-{date_and_hour[1]}.lz4"
+    else:  # l2book
+        bucket = BUCKET_L2BOOK
+        key = f"market_data/{date_hour}/l2Book/{asset}.lz4"
+        local_path = f"{DIR_PATH}/downloads/{asset}/{date_and_hour[0]}-{date_and_hour[1]}.lz4"
+
+    s3.download_file(bucket, key, local_path, ExtraArgs={'RequestPayer': 'requester'})
 
 
 
 
-async def download_objects(s3, assets, date_hour_list):
+async def download_objects(s3, assets, date_hour_list, data_type):
     print(f"Downloading {len(date_hour_list)} objects...")
-    for asset in assets:
-        await asyncio.gather(*[download_object(s3, asset, date_hour) for date_hour in date_hour_list])
+    if data_type == "trades":
+        # For trades, download once per hour (not per asset)
+        await asyncio.gather(*[download_object(s3, None, date_hour, data_type) for date_hour in date_hour_list])
+    else:
+        # For l2book, download per asset per hour
+        for asset in assets:
+            await asyncio.gather(*[download_object(s3, asset, date_hour, data_type) for date_hour in date_hour_list])
 
 
 
@@ -172,7 +191,7 @@ async def files_to_csv(assets, date_hour_list):
 
 def main():
     print(DIR_PATH)
-    s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
+    s3 = boto3.client('s3')  # Use default signed requests for requester-pays
     args = get_args()
 
     downloads_path = DIR_PATH / "downloads"
@@ -181,18 +200,26 @@ def main():
     csv_path = DIR_PATH / "csv"
     csv_path.mkdir(exist_ok=True)
 
-    for asset in args.t:
-        downloads_asset_path = downloads_path / asset
-        downloads_asset_path.mkdir(exist_ok=True)
-        csv_asset_path = csv_path / asset
-        csv_asset_path.mkdir(exist_ok=True)
+    if args.type == "trades":
+        # Create trades directory
+        trades_path = downloads_path / "trades"
+        trades_path.mkdir(exist_ok=True)
+        trades_csv_path = csv_path / "trades"
+        trades_csv_path.mkdir(exist_ok=True)
+    else:
+        # Create asset-specific directories for l2book data
+        for asset in args.t:
+            downloads_asset_path = downloads_path / asset
+            downloads_asset_path.mkdir(exist_ok=True)
+            csv_asset_path = csv_path / asset
+            csv_asset_path.mkdir(exist_ok=True)
 
     date_list = make_date_list(args.sd, args.ed)
     loop = asyncio.new_event_loop()
     
     if args.tool == "download":
         date_hour_list = make_date_hour_list(date_list, args.sh, args.eh)
-        loop.run_until_complete(download_objects(s3, args.t, date_hour_list))
+        loop.run_until_complete(download_objects(s3, args.t, date_hour_list, args.type))
         loop.close()
 
     if args.tool == "decompress":
